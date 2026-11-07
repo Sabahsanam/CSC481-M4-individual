@@ -69,4 +69,3 @@ player's stars, deaths and wins.
 
 ## Credits
 Art (princess, platforms, crate, star, bush, cloud, background) is from my Milestone 1 project. Skull, portal and totem art are from the team assets.
-AI assistance is disclosed in my written report.

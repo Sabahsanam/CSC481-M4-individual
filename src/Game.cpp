@@ -2,13 +2,26 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3_image/SDL_image.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <map>
+#include <set>
+#include <string>
+#include <thread>
 
 #include "GameLogic.h"
 #include "Input.h"
 #include "Timeline.h"
+#include "SharedData.h"
+#include "Networking.h"
 
-// Individual game built on the team engine: a side-scrolling platformer.
+// Milestone 4 individual game: Princess Star Race.
+// Up to four princesses race through the same level, each in their own
+// window. Run one window per player from the build folder:
+//   ./game 1      ./game 2      (./game 3, ./game 4)
+// Stars are shared: whoever grabs one first gets it, and it disappears for
+// everyone. The first princess to reach the portal wins the round.
 //
 // Controls
 //   A / D       move left / right
@@ -16,9 +29,11 @@
 //   W           jump
 //   P           pause / unpause
 //   - / +       slow down / speed up the game (Timeline scale)
-//   F1          show the hidden objects (spawn points, death zones,
+//   H or F1     show the hidden objects (spawn points, death zones,
 //               scroll boundaries)
 //   Esc         quit
+//
+// Run it with a player number: ./game 1 in one window, ./game 2 in another.
 
 // Draws one GameObject. Objects with neither a Renderable nor a Color are
 // hidden and are skipped.
@@ -79,6 +94,72 @@ static void drawObject(SDL_Renderer* renderer, GameObject& obj, float cameraX,
     }
 }
 
+// Each player has their own princess color
+static void playerTint(int id, Uint8& r, Uint8& g, Uint8& b)
+{
+    switch (id) {
+        case 2:  r = 140; g = 190; b = 255; break;   // blue
+        case 3:  r = 160; g = 255; b = 160; break;   // green
+        case 4:  r = 255; g = 220; b = 120; break;   // gold
+        default: r = 255; g = 255; b = 255; break;   // player 1: original colors
+    }
+}
+
+// Draws another player's princess at the position the network gave us.
+struct RemoteLook {
+    float lastX = 0.0f;
+    bool facingLeft = false;
+    int frame = 0;
+    float distance = 0.0f;   // walked since the last animation frame
+    bool seen = false;
+};
+
+static void drawRemotePrincess(SDL_Renderer* renderer, SDL_Texture* tex, int id,
+                               float x, float y, float cameraX, RemoteLook& look)
+{
+    // Work out walking direction and animation from how far they moved
+    if (look.seen) {
+        float dx = x - look.lastX;
+        if (dx < -0.5f) look.facingLeft = true;
+        if (dx > 0.5f) look.facingLeft = false;
+        look.distance += std::fabs(dx);
+        if (look.distance > 40.0f) {
+            look.frame = (look.frame + 1) % 8;
+            look.distance = 0.0f;
+        }
+    }
+    look.lastX = x;
+    look.seen = true;
+
+    SDL_FRect dst = { x - cameraX, y, 80.0f, 130.0f };
+    if (dst.x + dst.w < 0.0f || dst.x > level::SCREEN_W) {
+        return;
+    }
+    if (tex) {
+        Uint8 r, g, b;
+        playerTint(id, r, g, b);
+        SDL_SetTextureColorMod(tex, r, g, b);
+        SDL_FRect src = { static_cast<float>(look.frame * 96), 0.0f, 96.0f, 156.0f };
+        SDL_RenderTextureRotated(renderer, tex, &src, &dst, 0.0, nullptr,
+                                 look.facingLeft ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE);
+        SDL_SetTextureColorMod(tex, 255, 255, 255);
+    } else {
+        SDL_SetRenderDrawColor(renderer, 120, 160, 255, 255);
+        SDL_RenderFillRect(renderer, &dst);
+    }
+}
+
+// Small "P1"/"P2" label above a princess
+static void drawLabel(SDL_Renderer* renderer, int id, float x, float y, float cameraX)
+{
+    char label[8];
+    std::snprintf(label, sizeof(label), "P%d", id);
+    SDL_SetRenderScale(renderer, 2.0f, 2.0f);
+    SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+    SDL_RenderDebugText(renderer, (x - cameraX + 28.0f) / 2.0f, (y - 22.0f) / 2.0f, label);
+    SDL_SetRenderScale(renderer, 1.0f, 1.0f);
+}
+
 // Debug view: draws the hidden objects as translucent shapes.
 static void drawHiddenObjects(SDL_Renderer* renderer, GameWorld& w)
 {
@@ -122,8 +203,15 @@ static void drawHiddenObjects(SDL_Renderer* renderer, GameWorld& w)
 
 int main(int argc, char* argv[])
 {
-    (void)argc;
-    (void)argv;
+    // Which player this window is (1-4). Each window needs a different one.
+    int clientId = 1;
+    if (argc >= 2) {
+        clientId = std::atoi(argv[1]);
+    }
+    if (clientId < 1 || clientId > 4) {
+        SDL_Log("Usage: ./game <player 1-4>");
+        return 1;
+    }
 
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         SDL_Log("Could not initialize SDL: %s", SDL_GetError());
@@ -133,7 +221,9 @@ int main(int argc, char* argv[])
     SDL_Window* window = nullptr;
     SDL_Renderer* renderer = nullptr;
 
-    if (!SDL_CreateWindowAndRenderer("Individual Game", 1280, 720,
+    char title[64];
+    std::snprintf(title, sizeof(title), "Princess Star Race - Player %d", clientId);
+    if (!SDL_CreateWindowAndRenderer(title, 1280, 720,
                                      SDL_WINDOW_RESIZABLE,
                                      &window, &renderer)) {
         SDL_Log("Could not create window/renderer: %s", SDL_GetError());
@@ -166,10 +256,35 @@ int main(int argc, char* argv[])
                 SDL_GetError());
     }
 
+    Timeline gameTime;
+
     GameWorld world;
+    world.clientId = clientId;
+    world.clock = [&gameTime]() { return gameTime.getTime(); };   // event timestamps
     game::buildLevel(world, tex);
 
-    Timeline gameTime;
+    // Moving platforms and the skull follow the wall clock, so they are in
+    // the same place in every player's window.
+    world.time = std::fmod(std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count(), 3600.0);
+
+    // ---- Networking (team engine, peer-to-peer over ZeroMQ) ----
+    SharedData shared;
+    shared.eventManager = &world.events;   // events from other players are raised here
+    world.events.setNetworkSink([&shared](const GameEvent& e) { shared.queueOutgoingEvent(e); });
+    {
+        auto* pt = world.player.getComponent<TransformComponent>();
+        shared.playerX = pt->x;
+        shared.playerY = pt->y;
+    }
+    std::thread networkThread(networkingThread, std::ref(shared), clientId);
+
+    // Tell the others we are here (a networked Spawn event)
+    world.events.raiseNetworked(game::makeEvent(world, EventType::Spawn,
+                                                EventPriority::High, "joined", 0));
+
+    std::map<int, RemoteLook> remoteLooks;
+    std::set<int> playersLastFrame;
 
     bool running = true;
     bool showHidden = false;
@@ -220,7 +335,8 @@ int main(int argc, char* argv[])
         plusWasPressed = plusNow;
 
         // Show / hide the hidden objects
-        bool f1Now = Input::isKeyPressed(SDL_SCANCODE_F1);
+        bool f1Now = Input::isKeyPressed(SDL_SCANCODE_F1) ||
+                     Input::isKeyPressed(SDL_SCANCODE_H);   // F1 needs Fn on a Mac
         if (f1Now && !f1WasPressed) {
             showHidden = !showHidden;
         }
@@ -234,8 +350,37 @@ int main(int argc, char* argv[])
         input.run   = Input::isKeyPressed(SDL_SCANCODE_LSHIFT) ||
                       Input::isKeyPressed(SDL_SCANCODE_RSHIFT);
 
+        shared.timeScale.store(gameTime.getScale());
+
         if (!gameTime.isPaused()) {
             game::step(world, input, dt);
+        }
+
+        // Share our position with the other players
+        {
+            auto* pt = world.player.getComponent<TransformComponent>();
+            std::lock_guard<std::mutex> lock(shared.playerMutex);
+            shared.playerX = pt->x;
+            shared.playerY = pt->y;
+        }
+
+        // Copy the other players' positions (the network thread updates them)
+        std::map<int, RemotePlayerState> others;
+        {
+            std::lock_guard<std::mutex> lock(shared.playerMutex);
+            for (const auto& entry : shared.remotePlayers) {
+                others[entry.first] = entry.second;
+            }
+        }
+        for (int id : playersLastFrame) {
+            if (!others.count(id)) {
+                game::addFeed(world, "Player " + std::to_string(id) + " left the race");
+                remoteLooks.erase(id);
+            }
+        }
+        playersLastFrame.clear();
+        for (const auto& entry : others) {
+            playersLastFrame.insert(entry.first);
         }
 
         // ---- Draw ----
@@ -249,7 +394,22 @@ int main(int argc, char* argv[])
         for (auto& obj : world.objects) {
             drawObject(renderer, obj, world.cameraX);
         }
-        drawObject(renderer, world.player, world.cameraX, world.facingLeft);
+        // Other players first, so your own princess is on top
+        for (const auto& entry : others) {
+            drawRemotePrincess(renderer, tex.player, entry.first, entry.second.x,
+                               entry.second.y, world.cameraX, remoteLooks[entry.first]);
+            drawLabel(renderer, entry.first, entry.second.x, entry.second.y, world.cameraX);
+        }
+
+        {
+            Uint8 r, g, b;
+            playerTint(clientId, r, g, b);
+            if (tex.player) SDL_SetTextureColorMod(tex.player, r, g, b);
+            drawObject(renderer, world.player, world.cameraX, world.facingLeft);
+            if (tex.player) SDL_SetTextureColorMod(tex.player, 255, 255, 255);
+            auto* pt = world.player.getComponent<TransformComponent>();
+            drawLabel(renderer, clientId, pt->x, pt->y, world.cameraX);
+        }
 
         if (showHidden) {
             drawHiddenObjects(renderer, world);
@@ -259,21 +419,60 @@ int main(int argc, char* argv[])
         SDL_SetRenderScale(renderer, 2.0f, 2.0f);
         SDL_SetRenderDrawColor(renderer, 30, 30, 30, 255);
         SDL_RenderDebugText(renderer, 10.0f, 8.0f,
-                            "A/D move  Shift run  W jump  P pause  F1 hidden objects");
+                            "A/D move  Shift run  W jump  P pause  H hidden objects");
 
-        char status[128];
+        char status[160];
         std::snprintf(status, sizeof(status),
-                      "Stars: %d/%d   Deaths: %d   Wins: %d   Speed: %.1fx",
-                      world.coins, world.totalCoins, world.deaths, world.wins,
-                      gameTime.getScale());
+                      "PLAYER %d (you)  Round %d  Stars: %d/%d  Deaths: %d  Wins: %d  Speed: %.1fx",
+                      clientId, world.round, world.coins, world.totalCoins, world.deaths,
+                      world.wins, gameTime.getScale());
         SDL_RenderDebugText(renderer, 10.0f, 24.0f, status);
 
+        // One line per other player
+        float lineY = 40.0f;
+        for (const auto& entry : others) {
+            int id = entry.first;
+            std::snprintf(status, sizeof(status), "Player %d          Stars: %d  Deaths: %d  Wins: %d",
+                          id, world.remoteStars[id], world.remoteDeaths[id], world.remoteWins[id]);
+            SDL_RenderDebugText(renderer, 10.0f, lineY, status);
+            lineY += 16.0f;
+        }
+        if (others.empty()) {
+            SDL_RenderDebugText(renderer, 10.0f, lineY, "Waiting for other players... (start ./game 2)");
+            lineY += 16.0f;
+        }
+
+        std::snprintf(status, sizeof(status), "Last input event: %s",
+                      world.lastInput.empty() ? "-" : world.lastInput.c_str());
+        SDL_RenderDebugText(renderer, 10.0f, lineY, status);
+        lineY += 16.0f;
+
         if (gameTime.isPaused()) {
-            SDL_RenderDebugText(renderer, 10.0f, 40.0f, "PAUSED");
+            SDL_RenderDebugText(renderer, 10.0f, lineY, "PAUSED");
+            lineY += 16.0f;
+        }
+
+        // Event feed: the newest messages from the event handlers
+        lineY += 8.0f;
+        int shown = 0;
+        for (auto it = world.feed.rbegin(); it != world.feed.rend() && shown < 6; ++it) {
+            if (world.time - it->shownAt > 6.0) {
+                break;   // older messages fade out
+            }
+            SDL_SetRenderDrawColor(renderer, 150, 20, 60, 255);
+            SDL_RenderDebugText(renderer, 10.0f, lineY, it->text.c_str());
+            lineY += 12.0f;
+            shown++;
         }
         SDL_SetRenderScale(renderer, 1.0f, 1.0f);
 
         SDL_RenderPresent(renderer);
+    }
+
+    // Stop the networking thread
+    shared.running.store(false);
+    if (networkThread.joinable()) {
+        networkThread.join();
     }
 
     SDL_DestroyTexture(tex.player);
